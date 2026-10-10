@@ -91,9 +91,9 @@ function wikilinkPlugin(md, ctx) {
       if (IMAGE_EXT.test(path)) {
         const file = ctx.resolveFile(path);
         const size = /^(\d+)(?:x(\d+))?$/.exec(alias);
-        const style = size ? ` style="--w:${size[1]}px"` : '';
+        const style = size ? ` style="--w:${+size[1] / 19}"` : '';
         if (!file) return `<span class="missing-embed">${escapeHtml(path)}</span>`;
-        return `<img class="embed${size ? ' sized' : ''}" src="${ctx.fileUrl(file)}" alt="${escapeHtml(size ? path : alias || path)}"${style} loading="lazy">`;
+        return `<img class="embed${size ? ' sized' : ''}" src="${ctx.fileUrl(file)}${imageWidthQuery(size ? +size[1] : 0)}" data-full="${ctx.fileUrl(file)}" alt="${escapeHtml(size ? path : alias || path)}"${style} loading="lazy" decoding="async">`;
       }
       if (/\.excalidraw$|\.excalidraw\.md$/i.test(path)) {
         return `<span class="embed-card excalidraw">✎ Excalidraw drawing · ${escapeHtml(path.replace(/\.excalidraw(\.md)?$/i, ''))}</span>`;
@@ -208,17 +208,24 @@ export function createRenderer(ctx) {
   md.renderer.rules.image = (tokens, idx) => {
     const t = tokens[idx];
     let src = t.attrGet('src') || '';
-    if (!/^[a-z][a-z0-9+.-]*:/i.test(src)) {
-      const file = ctx.resolveFile(safeDecode(src));
-      if (file) src = ctx.fileUrl(file);
-    }
     const alt = t.children.map((c) => c.content).join('');
     const size = /^(.*?)\|\s*(\d+)$/.exec(alt);
-    const style = size ? ` style="--w:${size[2]}px"` : '';
-    return `<img class="embed${size ? ' sized' : ''}" src="${escapeHtml(src)}" alt="${escapeHtml(size ? size[1] : alt)}"${style} loading="lazy">`;
+    let full = '';
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(src)) {
+      const file = ctx.resolveFile(safeDecode(src));
+      if (file) { full = ctx.fileUrl(file); src = full + imageWidthQuery(size ? +size[2] : 0); }
+    }
+    const style = size ? ` style="--w:${+size[2] / 19}"` : '';
+    return `<img class="embed${size ? ' sized' : ''}" src="${escapeHtml(src)}"${full ? ` data-full="${escapeHtml(full)}"` : ''} alt="${escapeHtml(size ? size[1] : alt)}"${style} loading="lazy" decoding="async">`;
   };
 
   return md;
+}
+
+/** Ask the native side for an image no wider than it will be displayed (2x for Retina). */
+function imageWidthQuery(cssWidth) {
+  // 2x for Retina, 1.3x for the largest fluid text scale.
+  return `?w=${Math.round(Math.min(cssWidth ? cssWidth * 1.3 : 1300, 1400) * 2)}`;
 }
 
 function safeDecode(s) {

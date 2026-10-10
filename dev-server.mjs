@@ -30,7 +30,7 @@ http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ name: path.basename(VAULT), root: VAULT, ...data }));
     }
     let file;
-    if (url.pathname.startsWith('/vault/')) file = path.join(VAULT, decodeURIComponent(url.pathname.slice(7)));
+    if (url.pathname.startsWith('/vault/')) /* ?w= resizing is native-only */ file = path.join(VAULT, decodeURIComponent(url.pathname.slice(7)));
     else file = path.join(WEB, url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname));
     const body = await fs.readFile(file);
     res.writeHead(200, { 'content-type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream' });

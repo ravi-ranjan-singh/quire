@@ -69,13 +69,11 @@ function figures(root) {
       }
     }
     const w = img.getAttribute('width');
-    if (w && !img.style.getPropertyValue('--w')) {
-      img.style.setProperty('--w', /^\d+$/.test(w) ? w + 'px' : w);
+    if (w && /^\d+(px)?$/.test(w) && !img.style.getPropertyValue('--w')) {
+      img.style.setProperty('--w', parseInt(w, 10) / 19);
       img.removeAttribute('width');
       img.classList.add('sized');
     }
-    img.addEventListener('load', () => img.classList.add('loaded'), { once: true });
-    if (img.complete) img.classList.add('loaded');
   }
 }
 

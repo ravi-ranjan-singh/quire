@@ -44,7 +44,16 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1
+# Sign with the local certificate when present so the app's identity (and its macOS privacy permissions, e.g.
+# Documents access) survives rebuilds. Ad-hoc signatures change on every build and re-trigger the prompt.
+# See CLAUDE.md → "Code signing" to create the certificate.
+IDENTITY="Quire Local Signing"
+if security find-identity -p codesigning | grep -q "$IDENTITY"; then
+  codesign --force --sign "$IDENTITY" "$APP"
+else
+  echo "warning: '$IDENTITY' certificate not found; signing ad-hoc (macOS will re-ask for folder access after each build)"
+  codesign --force --sign - "$APP"
+fi
 mkdir -p ~/Applications
 rm -rf ~/Applications/Quire.app
 cp -R "$APP" ~/Applications/Quire.app

@@ -4,32 +4,12 @@ import { buildVault, searchTitles, searchContent, splitNumber } from './vault.js
 import { createRenderer, sliceSection, escapeHtml } from './markdown.js';
 import { enhance, flashText } from './enhance.js';
 import { isNative, post, fileUrl } from './native.js';
+import { store, loadSettings, applySettings, onSystemModeChange, resolvedMode, DEFAULTS, MODES, THEMES } from './settings.js';
+import { SettingsPage, ThemeArt } from './settings-page.jsx';
 import { Icon } from './icons.jsx';
 
-// ---------- persistence ----------
-
-const store = {
-  get(key, fallback) {
-    try { const v = localStorage.getItem('quire.' + key); return v == null ? fallback : JSON.parse(v); } catch { return fallback; }
-  },
-  set(key, value) {
-    try { localStorage.setItem('quire.' + key, JSON.stringify(value)); } catch {}
-  },
-};
-
-const DEFAULT_SETTINGS = { theme: 'auto', font: 'newyork', size: 19, width: 'normal' };
-const WIDTHS = { narrow: 620, normal: 700, wide: 820 };
-const FONTS = {
-  newyork: { label: 'New York', stack: 'ui-serif, "New York", Charter, Georgia, serif' },
-  charter: { label: 'Charter', stack: 'Charter, "Bitstream Charter", "Iowan Old Style", Georgia, serif' },
-  sans: { label: 'SF Pro', stack: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif' },
-};
-const THEMES = [
-  { id: 'auto', label: 'Auto' },
-  { id: 'paper', label: 'Paper' },
-  { id: 'sepia', label: 'Sepia' },
-  { id: 'night', label: 'Night' },
-];
+// Apply saved appearance before the first paint.
+applySettings(loadSettings());
 
 const progressStore = {
   all: () => store.get('progress', {}),
@@ -49,6 +29,7 @@ function parseRoute() {
   const params = new URLSearchParams(query);
   if (path.startsWith('/n/')) return { view: 'note', path: decodeURIComponent(path.slice(3)), heading: params.get('h') || '', q: params.get('q') || '' };
   if (path.startsWith('/f/')) return { view: 'folder', path: decodeURIComponent(path.slice(3)) };
+  if (path === '/settings') return { view: 'settings' };
   return { view: 'home' };
 }
 
@@ -67,6 +48,7 @@ export const openNote = (path, { heading = '', q = '', resume = false } = {}) =>
 };
 const openFolder = (path) => go('#/f/' + encodeURIComponent(path));
 const openHome = () => go('#/');
+const openSettings = () => go('#/settings');
 
 // ---------- helpers ----------
 
@@ -85,40 +67,34 @@ function NoteName({ name }) {
   return <>{num && <span class="num">{num}</span>}{label}</>;
 }
 
-function useThrottled(fn, ms) {
-  const last = useRef(0), timer = useRef(null), fnRef = useRef(fn);
-  fnRef.current = fn;
-  return useCallback((...args) => {
-    const now = Date.now();
-    clearTimeout(timer.current);
-    if (now - last.current >= ms) { last.current = now; fnRef.current(...args); }
-    else timer.current = setTimeout(() => { last.current = Date.now(); fnRef.current(...args); }, ms);
-  }, [ms]);
-}
-
 // ---------- app ----------
 
 function App() {
   const [vault, setVault] = useState(null);
   const [error, setError] = useState(null);
   const [route, setRoute] = useState(parseRoute);
-  const [settings, setSettingsState] = useState(() => ({ ...DEFAULT_SETTINGS, ...store.get('settings', {}) }));
+  const [settings, setSettingsState] = useState(loadSettings);
   const [sidebar, setSidebar] = useState(() => store.get('sidebar', true));
-  const [toc, setToc] = useState(() => store.get('toc', true));
   const [palette, setPalette] = useState(null);
-  const [panel, setPanel] = useState(false);
+  const [quick, setQuick] = useState(false);
   const [lightbox, setLightbox] = useState(null);
-  const [toast, setToast] = useState(null);
 
-  const setSettings = (patch) => setSettingsState((s) => { const n = { ...s, ...patch }; store.set('settings', n); return n; });
+  const setSettings = useCallback((patch) => setSettingsState((s) => {
+    const next = typeof patch === 'function' ? patch(s) : { ...s, ...patch };
+    store.set('settings', next);
+    return next;
+  }), []);
 
   const load = useCallback(async () => {
     try {
+      const t0 = performance.now();
       const res = await fetch('api/vault', { cache: 'no-store' });
       if (!res.ok) throw new Error(await res.text());
       const payload = await res.json();
       if (payload.error) throw new Error(payload.error);
-      setVault(buildVault(payload));
+      const v = buildVault(payload);
+      post('log', { message: `vault: ${v.notes.size} notes loaded+indexed in ${Math.round(performance.now() - t0)}ms` });
+      setVault(v);
       setError(null);
     } catch (e) {
       setError(String(e.message || e));
@@ -131,10 +107,19 @@ function App() {
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
-  useEffect(() => { store.set('sidebar', sidebar); }, [sidebar]);
-  useEffect(() => { store.set('toc', toc); }, [toc]);
+  // Keep the native glass (which sits under the sidebar) in step with the collapse animation.
+  const firstSidebar = useRef(true);
   useEffect(() => {
-    if (route.view === 'note') store.set('last', route.path);
+    store.set('sidebar', sidebar);
+    post('sidebar', { open: sidebar, width: 264, animate: !firstSidebar.current });
+    firstSidebar.current = false;
+  }, [sidebar]);
+  useEffect(() => { if (route.view === 'note') store.set('last', route.path); }, [route]);
+
+  // After settling on a page, let WebKit release images/tiles cached from the pages left behind.
+  useEffect(() => {
+    const t = setTimeout(() => post('trimMemory'), 2500);
+    return () => clearTimeout(t);
   }, [route]);
 
   // Reopen the last note on launch.
@@ -144,47 +129,35 @@ function App() {
     if (last && vault.notes.has(last)) openNote(last, { resume: true });
   }, [vault]);
 
-  // Theme → document + native appearance (so vibrancy and toolbar match).
-  useEffect(() => {
-    const root = document.documentElement;
-    const mq = matchMedia('(prefers-color-scheme: dark)');
-    const apply = () => {
-      const theme = settings.theme === 'auto' ? (mq.matches ? 'night' : 'paper') : settings.theme;
-      root.dataset.theme = theme;
-      post('appearance', { mode: settings.theme === 'auto' ? 'auto' : theme === 'night' ? 'dark' : 'light' });
-    };
-    apply();
-    mq.addEventListener('change', apply);
-    root.style.setProperty('--font-body', FONTS[settings.font]?.stack || FONTS.newyork.stack);
-    root.style.setProperty('--size', settings.size + 'px');
-    root.style.setProperty('--measure', (WIDTHS[settings.width] || 700) + 'px');
-    return () => mq.removeEventListener('change', apply);
+  useLayoutEffect(() => {
+    applySettings(settings);
+    if (settings.mode !== 'system') return;
+    return onSystemModeChange(() => applySettings(settings));
   }, [settings]);
-
-  const showToast = (msg) => { setToast(msg); clearTimeout(showToast.t); showToast.t = setTimeout(() => setToast(null), 1400); };
 
   const command = useCallback((name) => {
     switch (name) {
-      case 'quickOpen': setPanel(false); setPalette({ q: '' }); break;
+      case 'quickOpen': setQuick(false); setPalette({ q: '' }); break;
       case 'toggleSidebar': setSidebar((s) => !s); break;
-      case 'toggleToc': setToc((s) => !s); break;
-      case 'settings': setPalette(null); setPanel((p) => !p); break;
+      case 'toggleToc': setSettings((s) => ({ ...s, toc: !s.toc })); break;
+      case 'settings': setPalette(null); setQuick((p) => !p); break;
+      case 'settingsPage': setQuick(false); setPalette(null); openSettings(); break;
       case 'back': history.back(); break;
       case 'forward': history.forward(); break;
       case 'home': openHome(); break;
-      case 'zoomIn': setSettings({ size: Math.min(26, settings.size + 1) }); break;
-      case 'zoomOut': setSettings({ size: Math.max(14, settings.size - 1) }); break;
-      case 'zoomReset': setSettings({ size: DEFAULT_SETTINGS.size }); break;
+      case 'zoomIn': setSettings((s) => ({ ...s, size: Math.min(26, s.size + 1) })); break;
+      case 'zoomOut': setSettings((s) => ({ ...s, size: Math.max(14, s.size - 1) })); break;
+      case 'zoomReset': setSettings({ size: DEFAULTS.size }); break;
+      case 'toggleMode': setSettings((s) => ({ ...s, mode: resolvedMode(s) === 'dark' ? 'light' : 'dark' })); break;
       case 'reload': load(); break;
       default:
         if (name.startsWith('theme:')) setSettings({ theme: name.slice(6) });
+        if (name.startsWith('mode:')) setSettings({ mode: name.slice(5) });
     }
-  }, [settings, load]);
+  }, [load, setSettings]);
 
   // Native shell hooks.
-  useEffect(() => {
-    window.quire = { command, vaultChanged: load };
-  }, [command, load]);
+  useEffect(() => { window.quire = { command, vaultChanged: load }; }, [command, load]);
 
   // Keyboard shortcuts (handled here so the menu equivalents don't double-fire).
   useEffect(() => {
@@ -194,46 +167,48 @@ function App() {
       if (e.key === 'Escape') {
         if (lightbox) return setLightbox(null);
         if (palette) return setPalette(null);
-        if (panel) return setPanel(false);
+        if (quick) return setQuick(false);
       }
       if (!mod) return;
       const k = e.key.toLowerCase();
-      const map = {
-        k: 'quickOpen', p: 'quickOpen', o: e.shiftKey ? null : 'quickOpen', '\\': 'toggleSidebar', '[': 'back', ']': 'forward',
-        '=': 'zoomIn', '+': 'zoomIn', '-': 'zoomOut', '0': 'zoomReset', '.': 'toggleToc', ',': 'settings',
-      };
       if (e.shiftKey && k === 'h') { e.preventDefault(); return command('home'); }
+      if (e.shiftKey && k === 'l') { e.preventDefault(); return command('toggleMode'); }
+      if (e.shiftKey && k === 'a') { e.preventDefault(); return command('settings'); }
       if (e.ctrlKey && e.metaKey && k === 's') { e.preventDefault(); return command('toggleSidebar'); }
-      const cmd = map[k];
-      if (cmd && !(typing && (k === '[' || k === ']' || k === '-' || k === '='))) { e.preventDefault(); command(cmd); }
+      const map = {
+        k: 'quickOpen', p: 'quickOpen', '\\': 'toggleSidebar', '[': 'back', ']': 'forward',
+        '=': 'zoomIn', '+': 'zoomIn', '-': 'zoomOut', '0': 'zoomReset', '.': 'toggleToc', ',': 'settingsPage',
+      };
+      const cmd = e.shiftKey ? null : map[k];
+      if (cmd && !(typing && '[]-=+0'.includes(k))) { e.preventDefault(); command(cmd); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [command, lightbox, palette, panel]);
+  }, [command, lightbox, palette, quick]);
 
   const note = vault && route.view === 'note' ? vault.notes.get(route.path) || vault.resolveNote(route.path) : null;
 
   useEffect(() => {
-    post('title', { title: note ? note.title : vault ? vault.name : 'Quire' });
-  }, [note, vault]);
+    post('title', { title: note ? note.title : route.view === 'settings' ? 'Settings' : 'Quire' });
+  }, [note, route.view]);
 
   return (
-    <div class={`app ${sidebar ? '' : 'no-sidebar'} ${isNative ? 'native' : 'web'}`}>
+    <div class={`app ${sidebar ? '' : 'no-sidebar'} ${isNative ? 'native' : 'web'} ${settings.progress ? '' : 'no-progress'}`}>
       <Sidebar vault={vault} route={route} note={note} onSearch={() => command('quickOpen')} />
       <section class="pane">
         {!vault && !error && <div class="loading"><div class="spinner" /></div>}
-        {error && <ErrorView error={error} />}
-        {vault && route.view === 'home' && <Home vault={vault} />}
-        {vault && route.view === 'folder' && <FolderView vault={vault} path={route.path} />}
+        {error && route.view !== 'settings' && <ErrorView error={error} />}
+        {vault && route.view === 'home' && <Home key="home" vault={vault} />}
+        {vault && route.view === 'folder' && <FolderView key={'f:' + route.path} vault={vault} path={route.path} />}
+        {route.view === 'settings' && <SettingsPage key="settings" settings={settings} setSettings={setSettings} vault={vault} />}
         {vault && route.view === 'note' && (note
-          ? <Reader key="reader" vault={vault} note={note} route={route} showToc={toc} onLightbox={setLightbox} onToast={showToast} command={command} />
+          ? <Reader key="reader" vault={vault} note={note} route={route} settings={settings} onLightbox={setLightbox} />
           : <NotFound path={route.path} />)}
         {!isNative && <WebToolbar command={command} />}
       </section>
-      {panel && <SettingsPanel settings={settings} setSettings={setSettings} toc={toc} setToc={setToc} onClose={() => setPanel(false)} />}
+      {quick && <QuickPanel settings={settings} setSettings={setSettings} onClose={() => setQuick(false)} />}
       {palette && vault && <Palette vault={vault} initial={palette.q} onClose={() => setPalette(null)} />}
       {lightbox && <Lightbox src={lightbox} onClose={() => setLightbox(null)} />}
-      {toast && <div class="toast">{toast}</div>}
     </div>
   );
 }
@@ -277,12 +252,10 @@ function Sidebar({ vault, route, note, onSearch }) {
       const next = new Set(prev);
       let acc = '';
       for (const part of activeFolder.split('/')) { acc = acc ? acc + '/' + part : part; next.add(acc); }
-      return next;
+      return next.size === prev.size ? prev : next;
     });
   }, [activeFolder]);
   useEffect(() => { store.set('open', [...open]); }, [open]);
-
-  // Keep the active row visible.
   useEffect(() => {
     requestAnimationFrame(() => document.querySelector('.tree .row.active')?.scrollIntoView({ block: 'nearest' }));
   }, [note?.path]);
@@ -302,7 +275,7 @@ function Sidebar({ vault, route, note, onSearch }) {
               <span class="label">{f.name}</span>
               <span class="count">{f.count}</span>
             </div>
-            {isOpen && <div class="children">{renderFolder(f, depth + 1)}</div>}
+            {isOpen && renderFolder(f, depth + 1)}
           </div>
         );
       })}
@@ -329,9 +302,13 @@ function Sidebar({ vault, route, note, onSearch }) {
         <div class="section-label">Library</div>
         <div class="tree">{vault && renderFolder(vault.tree, 0)}</div>
       </nav>
-      <div class="sidebar-foot" onClick={() => post('chooseVault')} title={vault?.root}>
-        <Icon name="vault" /><span>{vault?.name || 'Quire'}</span>
-        {isNative && <Icon name="swap" class="swap" />}
+      <div class="sidebar-foot">
+        <button class="foot-btn vault" onClick={() => post('chooseVault')} title={vault?.root}>
+          <Icon name="vault" /><span>{vault?.name || 'Quire'}</span>
+        </button>
+        <button class={`foot-btn ${route.view === 'settings' ? 'active' : ''}`} onClick={openSettings} title="Settings (⌘,)">
+          <Icon name="gear" />
+        </button>
       </div>
     </aside>
   );
@@ -339,16 +316,19 @@ function Sidebar({ vault, route, note, onSearch }) {
 
 // ---------- reader ----------
 
-function Reader({ vault, note, route, showToc, onLightbox, onToast, command }) {
+function Reader({ vault, note, route, settings, onLightbox }) {
   const scrollRef = useRef(null);
   const articleRef = useRef(null);
+  const stripRef = useRef(null);
+  const barRef = useRef(null);
   const [headings, setHeadings] = useState([]);
   const [active, setActive] = useState(null);
-  const [progress, setProgress] = useState(0);
-  const [scrolled, setScrolled] = useState(false);
   const [preview, setPreview] = useState(null);
   const sessionScroll = useRef(new Map());
+  const frame = useRef(0);
+  const headingEls = useRef([]);
 
+  // One renderer + HTML cache per vault snapshot; navigating between notes reuses rendered HTML.
   const md = useMemo(() => {
     const ctx = { depth: 0, current: null, resolveNote: vault.resolveNote, resolveFile: vault.resolveFile, fileUrl };
     const renderer = createRenderer(ctx);
@@ -359,17 +339,28 @@ function Reader({ vault, note, route, showToc, onLightbox, onToast, command }) {
       ctx.depth--; ctx.current = saved;
       return html;
     };
+    const cache = new Map();
     const renderNote = (n, body = n.body) => { ctx.current = n; ctx.depth = 0; return renderer.render(body); };
-    return { renderNote };
+    const cached = (n) => {
+      if (!cache.has(n.path)) {
+        const t0 = performance.now();
+        if (cache.size >= 24) cache.delete(cache.keys().next().value);
+        cache.set(n.path, renderNote(n));
+        post('log', { message: `render ${n.path}: ${Math.round(performance.now() - t0)}ms` });
+      }
+      return cache.get(n.path);
+    };
+    return { renderNote, cached };
   }, [vault]);
 
-  const html = useMemo(() => md.renderNote(note), [md, note]);
+  const html = useMemo(() => md.cached(note), [md, note]);
 
-  // Post-process the article and position the scroll.
   useLayoutEffect(() => {
     const root = articleRef.current;
     enhance(root);
-    setHeadings([...root.querySelectorAll('h2, h3')].filter((h) => !h.closest('.transclusion, .callout')).map((h) => ({ id: h.id, text: h.textContent, level: +h.tagName[1] })));
+    const els = [...root.querySelectorAll('h2, h3')].filter((h) => !h.closest('.transclusion, .callout'));
+    headingEls.current = els;
+    setHeadings(els.map((h) => ({ id: h.id, text: h.textContent, level: +h.tagName[1] })));
   }, [html]);
 
   useLayoutEffect(() => {
@@ -389,25 +380,28 @@ function Reader({ vault, note, route, showToc, onLightbox, onToast, command }) {
     } else {
       el.scrollTop = 0;
     }
-    onScroll();
-  }, [note.path, route.heading, route.q]);
+    update();
+  }, [note.path, route.heading, route.q, html]);
 
-  const saveProgress = useThrottled((path, p) => progressStore.set(path, p), 800);
-
-  const onScroll = () => {
+  // Scroll work runs at most once per frame and touches the DOM directly — no re-render per scroll.
+  const lastSave = useRef(0);
+  const update = () => {
+    frame.current = 0;
     const el = scrollRef.current;
     if (!el) return;
     const max = el.scrollHeight - el.clientHeight;
     const p = max > 0 ? Math.min(1, el.scrollTop / max) : 1;
-    setProgress(p);
-    setScrolled(el.scrollTop > 140);
+    if (barRef.current) barRef.current.style.transform = `scaleX(${p})`;
+    stripRef.current?.classList.toggle('scrolled', el.scrollTop > 140);
     sessionScroll.current.set(location.hash, el.scrollTop);
-    saveProgress(note.path, p);
-    const hs = [...(articleRef.current?.querySelectorAll('h2, h3') || [])].filter((h) => !h.closest('.transclusion, .callout'));
+    const now = Date.now();
+    if (now - lastSave.current > 1000) { lastSave.current = now; progressStore.set(note.path, p); }
     let current = null;
-    for (const h of hs) { if (h.offsetTop - 110 <= el.scrollTop) current = h.id; else break; }
-    setActive(current);
+    for (const h of headingEls.current) { if (h.offsetTop - 110 <= el.scrollTop) current = h.id; else break; }
+    setActive((prev) => (prev === current ? prev : current));
   };
+  const onScroll = () => { if (!frame.current) frame.current = requestAnimationFrame(update); };
+  useEffect(() => () => cancelAnimationFrame(frame.current), []);
 
   const onClick = (e) => {
     const a = e.target.closest('a');
@@ -438,56 +432,58 @@ function Reader({ vault, note, route, showToc, onLightbox, onToast, command }) {
       return;
     }
     const img = e.target.closest('img');
-    if (img && !img.closest('a')) onLightbox(img.src);
+    if (img && !img.closest('a')) onLightbox(img.dataset.full || img.src);
   };
 
   // Hover previews for internal links.
   const hoverTimer = useRef(null);
   const onOver = (e) => {
+    if (!settings.previews) return;
     const a = e.target.closest('a[data-note]');
-    if (!a || a.closest('.preview')) return;
+    if (!a) return;
     clearTimeout(hoverTimer.current);
     hoverTimer.current = setTimeout(() => {
       const target = vault.notes.get(a.dataset.note);
       if (!target || target === note) return;
       const r = a.getBoundingClientRect();
-      const body = target.body.slice(0, 2500);
-      setPreview({ note: target, html: md.renderNote(target, body), x: r.left, y: r.bottom, top: r.top });
+      setPreview({ note: target, html: md.renderNote(target, target.body.slice(0, 2500)), x: r.left, y: r.bottom, top: r.top });
     }, 450);
   };
-  const onOut = (e) => {
-    if (e.target.closest('a[data-note]')) clearTimeout(hoverTimer.current);
-  };
+  const onOut = (e) => { if (e.target.closest('a[data-note]')) clearTimeout(hoverTimer.current); };
 
   const parts = note.folder ? note.folder.split('/') : [];
   const { num, label } = splitNumber(note.display);
   const backlinks = vault.backlinks(note.path);
   const sib = vault.siblings(note);
   const titleIsName = note.title === note.display;
+  const showToc = settings.toc && headings.length > 1;
 
   return (
     <div class="reader-scroll" ref={scrollRef} onScroll={onScroll}>
-      <header class={`strip ${scrolled ? 'scrolled' : ''}`}>
+      <header class="strip" ref={stripRef}>
         <div class="strip-title">{note.title}</div>
-        <div class="progress" style={{ transform: `scaleX(${progress})` }} />
+        <div class="progress" ref={barRef} />
       </header>
-      <div class={`page ${showToc && headings.length > 1 ? 'with-toc' : ''}`}>
-        <article class="note">
+      <div class={`page ${showToc ? 'with-toc' : ''}`}>
+        <article class="note" key={note.path}>
           <div class="note-head">
             {parts.length > 0 && (
               <div class="crumbs">
                 {parts.map((p, i) => (
-                  <span key={i}><a onClick={() => openFolder(parts.slice(0, i + 1).join('/'))}>{p}</a>{i < parts.length - 1 && <span class="sep">/</span>}</span>
+                  <Fragment key={i}>
+                    <a onClick={() => openFolder(parts.slice(0, i + 1).join('/'))}>{p}</a>
+                    {i < parts.length - 1 && <span class="sep">›</span>}
+                  </Fragment>
                 ))}
               </div>
             )}
             {num && titleIsName && <div class="part">Part {num}</div>}
             <h1 class="title">{titleIsName ? label : note.title}</h1>
             <div class="meta">
-              <span>{note.minutes} min read</span><span class="dot" />
-              <span>{note.words.toLocaleString()} words</span><span class="dot" />
-              <span>Updated {fmtDate(note.mtime)}</span>
-              {isNative && <><span class="dot" /><a class="meta-link" onClick={() => post('openInObsidian', { path: note.path })}>Edit in Obsidian</a></>}
+              <span class="chip"><Icon name="clock" />{note.minutes} min read</span>
+              <span class="chip"><Icon name="text" />{note.words.toLocaleString()} words</span>
+              <span class="chip"><Icon name="calendar" />{fmtDate(note.mtime)}</span>
+              {isNative && <a class="chip" onClick={() => post('openInObsidian', { path: note.path })}><Icon name="pencil" />Edit in Obsidian</a>}
             </div>
             {note.tags.length > 0 && <div class="tags">{note.tags.map((t) => <span class="tag" key={t}>#{t}</span>)}</div>}
           </div>
@@ -499,7 +495,7 @@ function Reader({ vault, note, route, showToc, onLightbox, onToast, command }) {
                 <div class="foot-label">Linked from</div>
                 {backlinks.map((b) => (
                   <a class="backlink" key={b.path} onClick={() => openNote(b.path)}>
-                    <span class="bl-title">{b.title}</span><span class="bl-path">{b.folder || 'Vault'}</span>
+                    <span>{b.title}</span><span class="bl-path">{b.folder || 'Vault'}</span>
                   </a>
                 ))}
               </div>
@@ -522,7 +518,7 @@ function Reader({ vault, note, route, showToc, onLightbox, onToast, command }) {
             )}
           </footer>
         </article>
-        {showToc && headings.length > 1 && (
+        {showToc && (
           <aside class="toc">
             <div class="toc-label">On this page</div>
             {headings.map((h) => (
@@ -545,10 +541,9 @@ function Preview({ preview, onClose }) {
   const [pos, setPos] = useState({ left: preview.x, top: preview.y + 8 });
   useLayoutEffect(() => {
     const el = ref.current, r = el.getBoundingClientRect();
-    let left = Math.min(preview.x, innerWidth - r.width - 16);
     let top = preview.y + 8;
     if (top + r.height > innerHeight - 16) top = Math.max(16, preview.top - r.height - 8);
-    setPos({ left: Math.max(16, left), top });
+    setPos({ left: Math.max(16, Math.min(preview.x, innerWidth - r.width - 16)), top });
     enhance(el.querySelector('.prose'));
   }, [preview]);
   return (
@@ -570,13 +565,12 @@ function greeting() {
 
 function Home({ vault }) {
   const progress = progressStore.all();
-  const totalWords = vault.sorted.reduce((s, n) => s + n.words, 0);
   const totalMinutes = vault.sorted.reduce((s, n) => s + n.minutes, 0);
   const reading = Object.entries(progress)
     .filter(([p, v]) => vault.notes.has(p) && v.p > 0.02 && v.p < 0.97)
-    .sort((a, b) => b[1].t - a[1].t).slice(0, 4)
+    .sort((a, b) => b[1].t - a[1].t).slice(0, 5)
     .map(([p, v]) => ({ note: vault.notes.get(p), ...v }));
-  const recent = vault.recent(6);
+  const [first, ...rest] = reading;
   const finished = vault.sorted.filter((n) => (progress[n.path]?.max || 0) >= 0.95).length;
 
   return (
@@ -586,46 +580,54 @@ function Home({ vault }) {
         <div class="home-hero">
           <div class="kicker">{new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</div>
           <h1>{greeting()}.</h1>
-          <p class="lede">
-            {vault.notes.size} notes in <em>{vault.name}</em> — about {fmtMinutes(totalMinutes)} of reading
-            across {totalWords.toLocaleString()} words. {finished > 0 && <>You've finished {finished} so far.</>}
-          </p>
+          <p class="lede">Your library <em>{vault.name}</em> is ready. Pick up where you left off, or wander somewhere new.</p>
+          <div class="stats">
+            <div class="stat"><b>{vault.notes.size}</b><span>notes</span></div>
+            <div class="stat"><b>{fmtMinutes(totalMinutes)}</b><span>of reading</span></div>
+            <div class="stat"><b>{finished}</b><span>finished</span></div>
+            <div class="stat"><b>{vault.tree.folders.length}</b><span>collections</span></div>
+          </div>
         </div>
 
-        {reading.length > 0 && (
+        {first && (
           <section>
-            <h2 class="home-h">Continue reading</h2>
-            <div class="cards">
-              {reading.map(({ note, p }) => (
-                <a class="card continue" key={note.path} onClick={() => openNote(note.path, { resume: true })}>
-                  <span class="card-path">{note.folder.split('/').slice(-1)[0] || vault.name}</span>
-                  <span class="card-title">{note.title}</span>
-                  <span class="card-meta">{Math.round((1 - p) * note.minutes) || 1} min left</span>
-                  <span class="bar"><span style={{ width: `${p * 100}%` }} /></span>
-                </a>
-              ))}
-            </div>
+            <h2 class="home-h"><Icon name="bookmark" />Continue reading</h2>
+            <a class="resume" onClick={() => openNote(first.note.path, { resume: true })}>
+              <div>
+                <div class="resume-path">{first.note.folder.split('/').slice(-1)[0] || vault.name}</div>
+                <div class="resume-title">{first.note.title}</div>
+                <div class="resume-meta">
+                  <span class="bar"><span style={{ width: `${first.p * 100}%` }} /></span>
+                  {Math.round(first.p * 100)}% · {Math.max(1, Math.round((1 - first.p) * first.note.minutes))} min left
+                </div>
+              </div>
+              <span class="resume-go"><Icon name="arrowRight" /></span>
+            </a>
+            {rest.length > 0 && (
+              <div class="cards">
+                {rest.map(({ note, p }) => (
+                  <a class="card" key={note.path} onClick={() => openNote(note.path, { resume: true })}>
+                    <span class="card-path">{note.folder.split('/').slice(-1)[0] || vault.name}</span>
+                    <span class="card-title">{note.title}</span>
+                    <span class="bar"><span style={{ width: `${p * 100}%` }} /></span>
+                  </a>
+                ))}
+              </div>
+            )}
           </section>
         )}
 
         <section>
-          <h2 class="home-h">Collections</h2>
+          <h2 class="home-h"><Icon name="stack" />Collections</h2>
           <div class="collections">
-            {vault.tree.folders.map((f) => <Collection key={f.path} folder={f} vault={vault} progress={progress} />)}
-            {vault.tree.notes.length > 0 && (
-              <div class="collection loose">
-                <a class="col-name" onClick={() => openNote(vault.tree.notes[0].path)}>Unfiled</a>
-                <div class="col-meta">{vault.tree.notes.length} notes</div>
-                <div class="col-list">{vault.tree.notes.slice(0, 4).map((n) => <a key={n.path} onClick={() => openNote(n.path)}>{n.title}</a>)}</div>
-              </div>
-            )}
+            {vault.tree.folders.map((f) => <Collection key={f.path} folder={f} progress={progress} />)}
           </div>
         </section>
 
         <section>
-          <h2 class="home-h">Recently updated</h2>
+          <h2 class="home-h"><Icon name="clock" />Recently updated</h2>
           <div class="list">
-            {recent.map((n) => (
+            {vault.recent(6).map((n) => (
               <a class="list-row" key={n.path} onClick={() => openNote(n.path)}>
                 <span class="lr-title">{n.title}</span>
                 <span class="lr-path">{n.folder}</span>
@@ -649,12 +651,13 @@ function Collection({ folder, progress }) {
   const minutes = all.reduce((s, n) => s + n.minutes, 0);
   return (
     <div class="collection">
-      <a class="col-name" onClick={() => openFolder(folder.path)}>{folder.name}</a>
-      <div class="col-meta">{all.length} notes · {fmtMinutes(minutes)}{done > 0 && ` · ${done} read`}</div>
+      <div class="col-icon"><Icon name="folder" /></div>
       <div class="col-ring"><Ring value={all.length ? done / all.length : 0} /></div>
+      <a class="col-name" onClick={() => openFolder(folder.path)}>{folder.name}</a>
+      <div class="col-meta">{all.length} {all.length === 1 ? 'note' : 'notes'} · {fmtMinutes(minutes)}{done > 0 && ` · ${done} read`}</div>
       <div class="col-list">
-        {folder.folders.slice(0, 5).map((f) => <a key={f.path} class="sub" onClick={() => openFolder(f.path)}><Icon name="folder" />{f.name}</a>)}
-        {folder.notes.slice(0, Math.max(0, 5 - folder.folders.length)).map((n) => <a key={n.path} onClick={() => openNote(n.path)}>{n.title}</a>)}
+        {folder.folders.slice(0, 4).map((f) => <a key={f.path} onClick={() => openFolder(f.path)}><Icon name="folder" />{f.name}</a>)}
+        {folder.notes.slice(0, Math.max(0, 4 - folder.folders.length)).map((n) => <a key={n.path} onClick={() => openNote(n.path)}><Icon name="doc" />{n.title}</a>)}
       </div>
     </div>
   );
@@ -673,9 +676,8 @@ function Ring({ value, size = 28 }) {
 // ---------- folder ----------
 
 function findFolder(tree, path) {
-  if (!path) return tree;
   let node = tree;
-  for (const part of path.split('/')) {
+  for (const part of path ? path.split('/') : []) {
     node = node.folders.find((f) => f.name === part);
     if (!node) return null;
   }
@@ -696,15 +698,15 @@ function FolderView({ vault, path }) {
         {parts.length > 1 && (
           <div class="crumbs">
             {parts.slice(0, -1).map((p, i) => (
-              <span key={i}><a onClick={() => openFolder(parts.slice(0, i + 1).join('/'))}>{p}</a><span class="sep">/</span></span>
+              <Fragment key={i}><a onClick={() => openFolder(parts.slice(0, i + 1).join('/'))}>{p}</a><span class="sep">›</span></Fragment>
             ))}
           </div>
         )}
         <h1 class="title">{folder.name}</h1>
         <div class="meta">
-          <span>{all.length} notes</span><span class="dot" />
-          <span>{fmtMinutes(all.reduce((s, n) => s + n.minutes, 0))} reading</span>
-          {done > 0 && <><span class="dot" /><span>{done} of {all.length} read</span></>}
+          <span class="chip"><Icon name="doc" />{all.length} notes</span>
+          <span class="chip"><Icon name="clock" />{fmtMinutes(all.reduce((s, n) => s + n.minutes, 0))}</span>
+          {done > 0 && <span class="chip"><Icon name="check" />{done} of {all.length} read</span>}
         </div>
         {folder.folders.length > 0 && (
           <div class="subfolders">
@@ -719,13 +721,13 @@ function FolderView({ vault, path }) {
           <ol class="lessons">
             {folder.notes.map((n, i) => {
               const pr = progress[n.path];
-              const { num } = splitNumber(n.name);
+              const { num, label } = splitNumber(n.display);
               const state = (pr?.max || 0) >= 0.95 ? 'done' : pr && pr.p > 0.02 ? 'started' : '';
               return (
                 <li key={n.path} class={`lesson ${state}`} onClick={() => openNote(n.path, { resume: state === 'started' })}>
                   <span class="lesson-num">{state === 'done' ? <Icon name="check" /> : num || String(i + 1).padStart(2, '0')}</span>
                   <span class="lesson-body">
-                    <span class="lesson-title">{n.title === n.display ? splitNumber(n.display).label : n.title}</span>
+                    <span class="lesson-title">{n.title === n.display ? label : n.title}</span>
                     <span class="lesson-snippet">{n.plain.slice(0, 160)}</span>
                   </span>
                   <span class="lesson-meta">{state === 'started' ? `${Math.round(pr.p * 100)}%` : `${n.minutes} min`}</span>
@@ -756,9 +758,7 @@ function Palette({ vault, initial, onClose }) {
 
   const results = useMemo(() => {
     const titles = searchTitles(vault, q, q ? 6 : 8).map((r) => ({ kind: 'note', ...r }));
-    const content = q.trim().length > 1
-      ? searchContent(vault, q, 25).map((r) => ({ kind: 'text', ...r }))
-      : [];
+    const content = q.trim().length > 1 ? searchContent(vault, q, 25).map((r) => ({ kind: 'text', ...r })) : [];
     return [...titles, ...content];
   }, [q, vault]);
 
@@ -793,8 +793,7 @@ function Palette({ vault, initial, onClose }) {
             <Fragment key={r.kind + r.note.path}>
               {i === 0 && r.kind === 'note' && <div class="palette-group">{q ? 'Notes' : 'Recently updated'}</div>}
               {i === firstText && <div class="palette-group">Mentions</div>}
-              <div class={`palette-item ${r.kind} ${i === sel ? 'sel' : ''}`}
-                onMouseMove={() => setSel(i)} onClick={() => choose(r)}>
+              <div class={`palette-item ${r.kind} ${i === sel ? 'sel' : ''}`} onMouseMove={() => setSel(i)} onClick={() => choose(r)}>
                 {r.kind === 'note' ? (
                   <>
                     <Icon name="doc" />
@@ -817,64 +816,50 @@ function Palette({ vault, initial, onClose }) {
   );
 }
 
-// ---------- settings ----------
+// ---------- quick appearance panel ----------
 
-function SettingsPanel({ settings, setSettings, toc, setToc, onClose }) {
+function QuickPanel({ settings, setSettings, onClose }) {
   useEffect(() => {
-    const close = (e) => { if (!e.target.closest('.settings, .web-toolbar')) onClose(); };
-    setTimeout(() => window.addEventListener('mousedown', close));
-    return () => window.removeEventListener('mousedown', close);
+    const close = (e) => { if (!e.target.closest('.quick, .web-toolbar')) onClose(); };
+    const t = setTimeout(() => window.addEventListener('mousedown', close));
+    return () => { clearTimeout(t); window.removeEventListener('mousedown', close); };
   }, []);
+  const mode = resolvedMode(settings);
   return (
-    <div class="settings">
-      <div class="set-group">
-        <div class="set-label">Theme</div>
-        <div class="swatches">
+    <div class="quick">
+      <div>
+        <div class="quick-label">Appearance</div>
+        <div class="seg">
+          {MODES.map((m) => <button key={m.id} class={settings.mode === m.id ? 'on' : ''} onClick={() => setSettings({ mode: m.id })}>{m.label}</button>)}
+        </div>
+      </div>
+      <div>
+        <div class="quick-label">Theme</div>
+        <div class="quick-themes">
           {THEMES.map((t) => (
-            <button key={t.id} class={`swatch sw-${t.id} ${settings.theme === t.id ? 'on' : ''}`} onClick={() => setSettings({ theme: t.id })}>
-              <span class="sw-chip">Aa</span><span>{t.label}</span>
+            <button key={t.id} class={`tile ${settings.theme === t.id ? 'on' : ''}`} onClick={() => setSettings({ theme: t.id, canvas: 'auto' })}>
+              <ThemeArt theme={t} mode={mode} />{t.label}
             </button>
           ))}
         </div>
       </div>
-      <div class="set-group">
-        <div class="set-label">Typeface</div>
-        <div class="seg">
-          {Object.entries(FONTS).map(([id, f]) => (
-            <button key={id} class={settings.font === id ? 'on' : ''} style={{ fontFamily: f.stack }} onClick={() => setSettings({ font: id })}>{f.label}</button>
-          ))}
-        </div>
-      </div>
-      <div class="set-group">
-        <div class="set-label">Size <span class="set-val">{settings.size}px</span></div>
+      <div>
+        <div class="quick-label">Text size <span>{settings.size}px</span></div>
         <div class="size-row">
           <button class="size-btn small" onClick={() => setSettings({ size: Math.max(14, settings.size - 1) })}>A</button>
           <input type="range" min="14" max="26" value={settings.size} onInput={(e) => setSettings({ size: +e.currentTarget.value })} />
           <button class="size-btn big" onClick={() => setSettings({ size: Math.min(26, settings.size + 1) })}>A</button>
         </div>
       </div>
-      <div class="set-group">
-        <div class="set-label">Line width</div>
-        <div class="seg">
-          {Object.keys(WIDTHS).map((w) => (
-            <button key={w} class={settings.width === w ? 'on' : ''} onClick={() => setSettings({ width: w })}>{w[0].toUpperCase() + w.slice(1)}</button>
-          ))}
-        </div>
+      <div class="quick-foot">
+        <button class="btn" onClick={() => { onClose(); openSettings(); }}><Icon name="gear" />All settings</button>
       </div>
-      <label class="set-toggle">
-        <span>Show table of contents</span>
-        <input type="checkbox" checked={toc} onChange={(e) => setToc(e.currentTarget.checked)} />
-      </label>
     </div>
   );
 }
 
 function Lightbox({ src, onClose }) {
-  return (
-    <div class="lightbox" onClick={onClose}>
-      <img src={src} />
-    </div>
-  );
+  return <div class="lightbox" onClick={onClose}><img src={src} /></div>;
 }
 
 render(<App />, document.getElementById('root'));

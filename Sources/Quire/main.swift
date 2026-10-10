@@ -6,8 +6,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var webView: WKWebView!
     private var schemeHandler: SchemeHandler!
     private var vault: Vault?
+    private var glass: NSVisualEffectView!
+    private var glassWidth: NSLayoutConstraint!
 
     private static let vaultKey = "vaultPath"
+    private static let backgroundKey = "windowBackground"
+    private static let sidebarKey = "sidebarWidth"
+    private static let defaultSidebarWidth: CGFloat = 264
+
+    /// Last theme background, so the window opens in the right colour before the page paints.
+    private static func savedBackground() -> NSColor {
+        guard let hex = UserDefaults.standard.string(forKey: backgroundKey) else { return .windowBackgroundColor }
+        return color(hex: hex) ?? .windowBackgroundColor
+    }
+
+    private static func color(hex: String) -> NSColor? {
+        let h = hex.trimmingCharacters(in: CharacterSet(charactersIn: "# "))
+        guard h.count == 6, let v = UInt32(h, radix: 16) else { return nil }
+        return NSColor(srgbRed: CGFloat(v >> 16 & 0xff) / 255, green: CGFloat(v >> 8 & 0xff) / 255, blue: CGFloat(v & 0xff) / 255, alpha: 1)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
@@ -30,11 +47,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         webView.uiDelegate = self
         if #available(macOS 13.3, *) { webView.isInspectable = true }
 
-        let background = NSVisualEffectView()
-        background.material = .sidebar
-        background.blendingMode = .behindWindow
-        background.state = .followsWindowActiveState
-
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1320, height: 860),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -44,7 +56,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.titlebarAppearsTransparent = true
         window.titlebarSeparatorStyle = .none
         window.minSize = NSSize(width: 640, height: 480)
-        window.contentView = background
+        window.backgroundColor = Self.savedBackground()
+        let container = NSView()
+        window.contentView = container
         window.isReleasedWhenClosed = false
         window.tabbingMode = .disallowed
 
@@ -55,13 +69,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.toolbar = toolbar
         window.toolbarStyle = .unified
 
-        webView.translatesAutoresizingMaskIntoConstraints = false
-        background.addSubview(webView)
+        // Real behind-window glass, only under the sidebar. The web sidebar is transparent above it;
+        // when the sidebar collapses this view shrinks to zero and is hidden, so it costs nothing.
+        glass = NSVisualEffectView()
+        glass.material = .sidebar
+        glass.blendingMode = .behindWindow
+        glass.state = .followsWindowActiveState
+        let savedWidth = UserDefaults.standard.object(forKey: Self.sidebarKey) as? CGFloat ?? Self.defaultSidebarWidth
+        glass.isHidden = savedWidth == 0
+        glassWidth = glass.widthAnchor.constraint(equalToConstant: savedWidth)
+
+        let drag = DragStrip()
+        drag.scrollTarget = webView
+        for view in [glass!, webView!, drag] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(view)
+        }
         NSLayoutConstraint.activate([
-            webView.leadingAnchor.constraint(equalTo: background.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: background.trailingAnchor),
-            webView.topAnchor.constraint(equalTo: background.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            webView.topAnchor.constraint(equalTo: container.topAnchor),
+            webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            drag.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            drag.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            drag.topAnchor.constraint(equalTo: container.topAnchor),
+            drag.heightAnchor.constraint(equalToConstant: 52),
+            glass.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            glass.topAnchor.constraint(equalTo: container.topAnchor),
+            glass.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            glassWidth,
         ])
 
         window.setFrameAutosaveName("QuireMain")
@@ -73,6 +109,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         DebugHooks.install(window: window, webView: webView)
     }
+
+    /// Drop WebKit's in-memory resource cache (decoded images, etc. from notes no longer on screen).
+    /// WebKit otherwise keeps them until the system is under memory pressure.
+    private func trimMemory() {
+        WKWebsiteDataStore.default().removeData(ofTypes: [WKWebsiteDataTypeMemoryCache], modifiedSince: .distantPast) {}
+    }
+
+    func applicationDidResignActive(_ notification: Notification) { trimMemory() }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
@@ -134,6 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggleLibrary(_ sender: Any?) { send("toggleSidebar") }
     @objc func toggleContents(_ sender: Any?) { send("toggleToc") }
     @objc func showAppearance(_ sender: Any?) { send("settings") }
+    @objc func showSettings(_ sender: Any?) { send("settingsPage") }
     @objc func goBack(_ sender: Any?) { send("back") }
     @objc func goForward(_ sender: Any?) { send("forward") }
     @objc func goHome(_ sender: Any?) { send("home") }
@@ -168,7 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         submenu("Quire", [
             item("About Quire", #selector(NSApplication.orderFrontStandardAboutPanel(_:))),
             .separator(),
-            item("Appearance…", #selector(showAppearance(_:)), ","),
+            item("Settings…", #selector(showSettings(_:)), ","),
             .separator(),
             item("Hide Quire", #selector(NSApplication.hide(_:)), "h"),
             item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]),
@@ -201,6 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         submenu("View", [
             item("Toggle Library", #selector(toggleLibrary(_:)), "s", [.command, .control]),
             item("Toggle Contents", #selector(toggleContents(_:)), "."),
+            item("Quick Appearance", #selector(showAppearance(_:)), "a", [.command, .shift]),
             .separator(),
             item("Larger Text", #selector(zoomIn(_:)), "+"),
             item("Smaller Text", #selector(zoomOut(_:)), "-"),
@@ -287,6 +333,22 @@ extension AppDelegate: WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegat
             if let url = c.url { NSWorkspace.shared.open(url) }
         case "chooseVault":
             chooseVault(nil)
+        case "trimMemory":
+            trimMemory()
+        case "sidebar":
+            let open = body["open"] as? Bool ?? true
+            let width = open ? CGFloat((body["width"] as? NSNumber)?.doubleValue ?? Double(Self.defaultSidebarWidth)) : 0
+            UserDefaults.standard.set(width, forKey: Self.sidebarKey)
+            guard glassWidth.constant != width else { return }
+            if open { glass.isHidden = false }
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = (body["animate"] as? Bool ?? true) ? 0.3 : 0
+                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1)
+                ctx.allowsImplicitAnimation = true
+                glassWidth.animator().constant = width
+            }, completionHandler: { [weak self] in
+                if !open { self?.glass.isHidden = true }
+            })
         case "title":
             window.title = body["title"] as? String ?? "Quire"
         case "appearance":
@@ -295,6 +357,14 @@ extension AppDelegate: WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegat
             case "light": NSApp.appearance = NSAppearance(named: .aqua)
             default: NSApp.appearance = nil
             }
+            if let hex = body["background"] as? String, let color = Self.color(hex: hex) {
+                window.backgroundColor = color
+                UserDefaults.standard.set(hex, forKey: Self.backgroundKey)
+            }
+        case "log":
+            if ProcessInfo.processInfo.environment["QUIRE_DEBUG"] != nil { print("[web]", body["message"] ?? "") ; fflush(stdout) }
+        case "revealVault":
+            revealVault(nil)
         default:
             break
         }

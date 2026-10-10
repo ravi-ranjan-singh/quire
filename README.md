@@ -38,7 +38,9 @@ GFM tables and task lists, footnotes, and syntax highlighting (unlabelled code b
 | ⌘[ / ⌘] | Back / forward (or two-finger swipe) |
 | ⌃⌘S or ⌘\ | Toggle library |
 | ⌘. | Toggle contents |
-| ⌘, | Appearance (theme, typeface, size, width) |
+| ⌘, | Settings (mode, theme, accent, background, fonts, reading options) |
+| ⇧⌘A | Quick appearance panel |
+| ⇧⌘L | Toggle light / dark |
 | ⌘+ / ⌘− / ⌘0 | Text size |
 | ⇧⌘H | Home |
 | ⇧⌘O | Open a different vault |

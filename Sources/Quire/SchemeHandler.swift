@@ -20,6 +20,8 @@ final class SchemeHandler: NSObject, WKURLSchemeHandler {
         let id = ObjectIdentifier(task)
         active.insert(id)
         let path = task.request.url?.path.removingPercentEncoding ?? "/"
+        let width = task.request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
+            .queryItems?.first { $0.name == "w" }?.value.flatMap(Int.init)
         let vault = self.vault
         let webRoot = self.webRoot
 
@@ -31,7 +33,11 @@ final class SchemeHandler: NSObject, WKURLSchemeHandler {
                     result = .success((try vault.payload(), "application/json"))
                 } else if path.hasPrefix("/vault/") {
                     guard let vault, let url = vault.file(at: String(path.dropFirst(7))) else { throw Self.error("Not found") }
-                    result = .success((try Data(contentsOf: url), Self.mime(for: url)))
+                    if let scaled = try? ImageScaler.data(for: url, width: width) {
+                        result = .success(scaled)
+                    } else {
+                        result = .success((try Data(contentsOf: url, options: .mappedIfSafe), Self.mime(for: url)))
+                    }
                 } else {
                     let rel = path == "/" ? "index.html" : String(path.dropFirst())
                     let url = webRoot.appendingPathComponent(rel).standardizedFileURL
